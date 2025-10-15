@@ -1,0 +1,198 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>色軌｜四肢軌跡互動牆（極簡版）</title>
+  <style>
+    :root{ --bg0:#020409; --bg1:#081224; --fg:#eaf6ff; --muted:#a8b9c5; --bdr:#1b2530; }
+    *{box-sizing:border-box}
+    html,body{height:100%}
+    body{margin:0; background:radial-gradient(1200px 800px at 70% 20%, var(--bg1), var(--bg0) 60%, #000); color:var(--fg); font-family:ui-sans-serif, system-ui, -apple-system}
+    header{position:fixed; left:16px; top:16px; z-index:20}
+    .brand{letter-spacing:.12em; font-weight:700; font-size:14px; color:var(--muted)}
+    .brand b{color:#7fe3ff}
+
+    .toolbar{position:fixed; right:16px; top:16px; z-index:30; width:320px; background:linear-gradient(180deg,#0e131a,#0a0d12); border:1px solid var(--bdr); border-radius:14px; padding:12px; box-shadow:0 8px 24px rgba(0,0,0,.45)}
+    .toolbar h2{margin:0 0 8px 0; font-size:14px; color:#cfe2ef; letter-spacing:.04em}
+    .row{display:flex; align-items:center; gap:8px; margin:8px 0}
+    .row label{width:100px; color:#c0d0da; font-size:12px}
+    select, button, input[type="range"]{flex:1; background:#121820; color:var(--fg); border:1px solid #1d2833; border-radius:10px; padding:8px 10px; font-size:12px}
+    button{cursor:pointer}
+    .badge{display:inline-flex; align-items:center; gap:6px; padding:4px 10px; border-radius:999px; border:1px solid #2b2b2b; background:#121212; color:#a8b0b3; font-size:11px}
+    .dot{width:8px; height:8px; border-radius:50%; background:#666}
+    .dot.on{background:#57d38a}
+    .stage{position:fixed; inset:0; display:grid; place-items:center}
+    canvas{width:100vw; height:100vh; display:block; background:#000}
+    video{display:none}
+    .hint{position:fixed; left:50%; bottom:28px; transform:translateX(-50%); color:#b4bdc1; background:#071015aa; border:1px solid #13303a; padding:8px 12px; border-radius:999px; font-size:12px; backdrop-filter: blur(6px)}
+  </style>
+</head>
+<body>
+  <header><div class="brand"><b>COLOR TRAIL</b> · 色軌（四肢）</div></header>
+
+  <div class="toolbar" role="region" aria-label="控制面板">
+    <h2>控制面板（極簡）</h2>
+    <div class="row"><label>攝影機</label><span class="badge"><span id="camDot" class="dot"></span>Camera</span><span id="fps" class="badge">FPS: --</span></div>
+    <div class="row"><label>亮色主題</label>
+      <select id="theme">
+        <option value="neon">Neon（黃/綠/青/粉）</option>
+        <option value="lime">Lime（螢光綠）</option>
+        <option value="sun">Sun（螢光黃橙）</option>
+        <option value="aqua">Aqua（青藍電光）</option>
+      </select>
+    </div>
+    <div class="row"><label>軌跡粗細</label><input id="thick" type="range" min="2" max="40" step="1" value="12"/></div>
+    <div class="row"><label>發光強度</label><input id="glow" type="range" min="0" max="1" step="0.01" value="0.7"/></div>
+    <div class="row"><label>消退速度</label><input id="fade" type="range" min="0.85" max="0.995" step="0.001" value="0.97"/></div>
+    <div class="row"><label>操作</label><button id="start">啟動攝影機</button><button id="clear">清空</button><button id="save">存圖</button></div>
+  </div>
+
+  <div class="stage">
+    <canvas id="stage" width="1920" height="1080" aria-label="四肢軌跡畫布"></canvas>
+    <video id="video" playsinline></video>
+  </div>
+
+  <div class="hint">抬手、揮動手臂或抬腳，會在黑幕上留下亮色軌跡，並逐漸淡出。</div>
+
+  <script type="module">
+    import { FilesetResolver, PoseLandmarker } from 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3';
+
+    const video = document.getElementById('video');
+    const canvas = document.getElementById('stage');
+    const ctx = canvas.getContext('2d');
+
+    const camDot = document.getElementById('camDot');
+    const fpsBadge = document.getElementById('fps');
+    const startBtn = document.getElementById('start');
+    const clearBtn = document.getElementById('clear');
+    const saveBtn = document.getElementById('save');
+    const themeSel = document.getElementById('theme');
+    const thickRange = document.getElementById('thick');
+    const glowRange = document.getElementById('glow');
+    const fadeRange = document.getElementById('fade');
+
+    // Palettes
+    const palettes = {
+      neon:["#eaff00","#19ff6d","#18d8ff","#ff6df5"],
+      lime:["#a8ff00","#7fff00","#b6ff3b","#d5ff7a"],
+      sun:["#fff200","#ffc300","#ffb100","#ffd966"],
+      aqua:["#00f7ff","#16d9ff","#3fbfff","#7fe3ff"]
+    };
+
+    // Limbs we will draw trails for (index in BlazePose):
+    // wrists: 15(L), 16(R); elbows: 13(L),14(R); ankles: 27(L),28(R); knees: 25(L),26(R)
+    const JOINTS = [13,14,15,16,25,26,27,28];
+
+    // State
+    let landmarker=null, running=false;
+    let trails = JOINTS.map(()=>({x:null,y:null}));
+
+    // Back buffer for persistent trails with fade
+    const trailCanvas = document.createElement('canvas');
+    trailCanvas.width = canvas.width; trailCanvas.height = canvas.height;
+    const trailCtx = trailCanvas.getContext('2d');
+
+    function fit(){ canvas.style.width=innerWidth+'px'; canvas.style.height=innerHeight+'px'; }
+    addEventListener('resize', fit); fit();
+
+    function clearAll(){
+      ctx.fillStyle = '#000'; ctx.fillRect(0,0,canvas.width,canvas.height);
+      trailCtx.fillStyle = '#000'; trailCtx.fillRect(0,0,trailCanvas.width,trailCanvas.height);
+    }
+    clearAll();
+
+    function getColor(idx){ const pal = palettes[themeSel.value]||palettes.neon; return pal[idx%pal.length]; }
+
+    function drawGlowLine(gctx, x0,y0,x1,y1, color, w, glow){
+      if(x0==null||y0==null) return;
+      gctx.save();
+      gctx.lineCap='round'; gctx.lineJoin='round';
+      gctx.globalCompositeOperation='lighter';
+      if(glow>0){
+        gctx.strokeStyle=color; gctx.shadowColor=color; gctx.shadowBlur = w*(10*glow+2); gctx.lineWidth=w*1.35;
+        gctx.beginPath(); gctx.moveTo(x0,y0); gctx.lineTo(x1,y1); gctx.stroke();
+      }
+      gctx.shadowBlur=0; gctx.lineWidth=w; gctx.strokeStyle=color;
+      gctx.beginPath(); gctx.moveTo(x0,y0); gctx.lineTo(x1,y1); gctx.stroke();
+      gctx.restore();
+    }
+
+    async function init(){
+      // camera
+      const stream = await navigator.mediaDevices.getUserMedia({video:{width:{ideal:1280}, height:{ideal:720}, frameRate:{ideal:60}, facingMode:'user'}, audio:false});
+      video.srcObject = stream; await video.play(); camDot.classList.add('on');
+
+      // model
+      const resolver = await FilesetResolver.forVisionTasks('https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.3/wasm');
+      landmarker = await PoseLandmarker.createFromOptions(resolver, {
+        baseOptions: { modelAssetPath: 'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task' },
+        runningMode: 'VIDEO',
+        numPoses: 1,
+        minPoseDetectionConfidence: 0.4,
+        minPosePresenceConfidence: 0.4,
+        minTrackingConfidence: 0.4
+      });
+    }
+
+    function mapPoint(p){ // mirror X for mirror-like interaction
+      return { x: (1-p.x)*canvas.width, y: p.y*canvas.height };
+    }
+
+    async function loop(){
+      if(!running) return; requestAnimationFrame(loop);
+      const now = performance.now();
+      const res = landmarker.detectForVideo(video, now);
+
+      // Fade trails slightly towards black
+      const fade = parseFloat(fadeRange.value); // 0.85..0.995
+      trailCtx.save();
+      trailCtx.globalCompositeOperation='source-over';
+      trailCtx.fillStyle = `rgba(0,0,0,${1-fade})`;
+      trailCtx.fillRect(0,0,trailCanvas.width,trailCanvas.height);
+      trailCtx.restore();
+
+      // Draw new segments
+      if(res && res.landmarks && res.landmarks[0]){
+        const lms = res.landmarks[0];
+        JOINTS.forEach((j,idx)=>{
+          const p = lms[j];
+          if(!p) return;
+          const pt = mapPoint(p);
+          const t = trails[idx];
+          const w = parseInt(thickRange.value,10);
+          const glow = parseFloat(glowRange.value);
+          const color = getColor(idx);
+          if(t.x!=null){ drawGlowLine(trailCtx, t.x,t.y, pt.x,pt.y, color, w, glow); }
+          t.x = pt.x; t.y = pt.y;
+        });
+      } else {
+        // if no pose, slowly clear previous anchors
+        trails.forEach(t=>{ t.x=null; t.y=null; });
+      }
+
+      // Composite trail layer to main canvas
+      ctx.drawImage(trailCanvas, 0, 0);
+
+      // FPS
+      fpsCounter();
+    }
+
+    let frames=0, lastStamp=performance.now();
+    function fpsCounter(){
+      frames++; const t=performance.now(); if(t-lastStamp>500){ const fps=Math.round(frames*1000/(t-lastStamp)); fpsBadge.textContent='FPS: '+fps; frames=0; lastStamp=t; }
+    }
+
+    startBtn.addEventListener('click', async()=>{ if(running) return; running=true; await init(); loop(); });
+    clearBtn.addEventListener('click', clearAll);
+    saveBtn.addEventListener('click', ()=>{ const a=document.createElement('a'); a.download='color-trail-'+Date.now()+'.png'; a.href=canvas.toDataURL('image/png'); a.click(); });
+
+    // Shortcuts
+    addEventListener('keydown', (e)=>{ if(e.key==='c'||e.key==='C') clearAll(); if(e.key==='s'||e.key==='S') saveBtn.click(); });
+
+    // Watermark
+    function label(){ ctx.save(); ctx.font='600 18px ui-sans-serif, system-ui'; ctx.fillStyle='rgba(255,255,255,.85)'; ctx.fillText('COLOR TRAIL · 色軌', 24, canvas.height-26); ctx.fillStyle='rgba(180,200,210,.9)'; ctx.font='400 12px ui-sans-serif, system-ui'; ctx.fillText(new Date().toLocaleString(), 24, canvas.height-8); ctx.restore(); }
+    setInterval(label, 1500);
+  </script>
+</body>
+</html>
